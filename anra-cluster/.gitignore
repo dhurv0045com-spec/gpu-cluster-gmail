@@ -1,0 +1,9 @@
+node_modules/
+frontend/dist/
+*.pyc
+__pycache__/
+.env
+*.pt
+*.zip
+*.egg-info/
+.pytest_cache/
