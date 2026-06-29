@@ -15,13 +15,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from database import init_db, ClusterState
-from aggregator import aggregate_gradients
-from worker_registry import (
+from .database import init_db, ClusterState
+from .aggregator import aggregate_gradients
+from .worker_registry import (
     register_worker, heartbeat, get_all_workers, get_active_workers,
     should_aggregate, reap_stale_workers,
 )
-from drive_sync import DriveSync
+from .drive_sync import DriveSync
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("anra-coordinator")

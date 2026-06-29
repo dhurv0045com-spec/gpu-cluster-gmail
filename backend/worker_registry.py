@@ -1,6 +1,6 @@
 import time
 from sqlmodel import select
-from database import Worker, ClusterState, engine, get_worker_session
+from .database import Worker, ClusterState, engine, get_worker_session
 
 WORKER_TIMEOUT = 120
 
