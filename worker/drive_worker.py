@@ -1,9 +1,14 @@
-import os
 import json
-import time
+import os
 import signal
-import torch
 from pathlib import Path
+
+import torch
+
+try:
+    from .sparse_grad import save_sparse_gradient, sparsify_gradients
+except ImportError:  # Colab imports worker modules directly from their folder.
+    from sparse_grad import save_sparse_gradient, sparsify_gradients
 
 
 _worker_should_stop = False
@@ -39,34 +44,27 @@ def read_coordinator_state(cluster_drive_folder: str) -> dict:
     try:
         with open(state_path) as f:
             return json.load(f)
-    except (json.JSONDecodeError, IOError):
+    except (OSError, json.JSONDecodeError):
         return {}
 
 
 def save_gradients_to_drive(model, step: int, worker_id: str, cluster_drive_folder: str,
                             model_version: int, token_count: int, loss: float = None,
-                            use_fp16: bool = True) -> str:
-    grad_dict = {}
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            grad = param.grad.cpu()
-            if use_fp16:
-                grad = grad.half()
-            grad_dict[name] = grad.clone()
-
-    save_data = {
-        "step": step,
-        "worker_id": worker_id,
-        "model_version": model_version,
-        "token_count": token_count,
-        "loss": loss,
-        "gradients": grad_dict,
-        "use_fp16": use_fp16,
-    }
+                            use_fp16: bool = True, topk_fraction: float = 0.01) -> str:
+    """Save a compact top-k payload; retained name keeps notebook API stable."""
+    del loss, use_fp16
+    save_data = sparsify_gradients(
+        dict(model.named_parameters()),
+        token_count=token_count,
+        worker_id=worker_id,
+        step=step,
+        model_version=model_version,
+        topk_fraction=topk_fraction,
+    )
     worker_dir = Path(cluster_drive_folder) / worker_id
     worker_dir.mkdir(parents=True, exist_ok=True)
-    grad_path = worker_dir / f"grad_step_{step:06d}.pt"
-    torch.save(save_data, str(grad_path))
+    grad_path = worker_dir / f"grad_step_{step:06d}.npz"
+    save_sparse_gradient(save_data, str(grad_path))
     return str(grad_path)
 
 

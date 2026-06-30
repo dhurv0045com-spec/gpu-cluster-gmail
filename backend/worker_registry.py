@@ -1,8 +1,11 @@
 import time
+
 from sqlmodel import select
-from .database import Worker, ClusterState, engine, get_worker_session
+
+from .database import ClusterState, Worker, get_worker_session
 
 WORKER_TIMEOUT = 120
+GRADIENT_TIMEOUT = 300
 
 
 def register_worker(worker_id: str, account_email: str, drive_folder_id: str, ip_address: str = None) -> dict:
@@ -57,6 +60,8 @@ def heartbeat(worker_id: str, current_step: int, loss: float = None,
         state = session.get(ClusterState, 1)
         if not state:
             return "continue"
+        if state.total_target_steps > 0 and state.global_step >= state.total_target_steps:
+            return "stop"
         if state.phase == "aggregating":
             return "pause"
         if state.phase == "paused":
@@ -96,7 +101,6 @@ def get_active_workers() -> list[str]:
 
 
 def should_aggregate(step: int, submitted_workers: set, earliest_submission_time: float = None) -> bool:
-    GRADIENT_TIMEOUT = 300
     active = set(get_active_workers())
     if not active:
         return False

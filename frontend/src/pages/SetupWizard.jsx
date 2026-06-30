@@ -1,14 +1,19 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api } from '../lib/api'
 
 const steps = [
+  { id: 0, label: 'Connect Drive' },
   { id: 1, label: 'Configure Cluster' },
   { id: 2, label: 'Initialize' },
   { id: 3, label: 'Launch Workers' },
 ]
 
 export default function SetupWizard() {
-  const [step, setStep] = useState(1)
+  const [step, setStep] = useState(0)
+  const [authenticated, setAuthenticated] = useState(false)
+  const [checkingAuth, setCheckingAuth] = useState(true)
+  const [authUrl, setAuthUrl] = useState('')
+  const oauthWindow = useRef(null)
   const [folderId, setFolderId] = useState('')
   const [numWorkers, setNumWorkers] = useState(3)
   const [targetSteps, setTargetSteps] = useState(100000)
@@ -17,6 +22,55 @@ export default function SetupWizard() {
   const [workerLinks, setWorkerLinks] = useState([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
+
+  useEffect(() => {
+    let mounted = true
+    let timer
+
+    async function checkAuthentication() {
+      try {
+        const result = await api.getAuthStatus()
+        if (!mounted) return
+        setAuthenticated(result.authenticated)
+        setCheckingAuth(false)
+        if (result.authenticated) {
+          setStep(current => Math.max(current, 1))
+          oauthWindow.current?.close()
+        }
+      } catch (err) {
+        if (mounted) {
+          setCheckingAuth(false)
+          setError(err.message)
+        }
+      }
+    }
+
+    checkAuthentication()
+    timer = setInterval(checkAuthentication, 2000)
+    return () => {
+      mounted = false
+      clearInterval(timer)
+    }
+  }, [])
+
+  async function handleConnectDrive() {
+    setLoading(true)
+    setError(null)
+    setAuthUrl('')
+    // Opening synchronously preserves popup permission while the URL request runs.
+    const popup = window.open('about:blank', 'anra-drive-oauth')
+    oauthWindow.current = popup
+    try {
+      const result = await api.getAuthLogin()
+      setAuthUrl(result.authorization_url)
+      if (popup) popup.location.href = result.authorization_url
+    } catch (err) {
+      popup?.close()
+      setError(err.message)
+    } finally {
+      setLoading(false)
+    }
+  }
 
   function validateStep1() {
     if (!folderId.trim()) return 'Folder ID is required'
@@ -27,6 +81,11 @@ export default function SetupWizard() {
   }
 
   async function handleInit() {
+    if (!authenticated) {
+      setStep(0)
+      setError('Connect Google Drive before configuring the cluster')
+      return
+    }
     const validationError = validateStep1()
     if (validationError) {
       setError(validationError)
@@ -51,8 +110,8 @@ export default function SetupWizard() {
         return {
           workerId: wid,
           email: `account_${i + 1}@gmail.com`,
-          notebookUrl: 'https://colab.research.google.com/github/YOUR_ORG/anra-cluster/blob/main/worker/AN_RA_CLUSTER_WORKER.ipynb',
-          config: `WORKER_ID="${wid}"\nACCOUNT_EMAIL="${wid.toLowerCase()}@gmail.com"`,
+          notebookUrl: 'https://colab.research.google.com/github/dhurv0045com-spec/gpu-cluster-gmail/blob/main/worker/AN_RA_CLUSTER_WORKER.ipynb',
+          config: `WORKER_ID="${wid}"\nACCOUNT_EMAIL="replace_with_worker_${i + 1}_gmail@gmail.com"`,
         }
       })
       setWorkerLinks(links)
@@ -90,6 +149,43 @@ export default function SetupWizard() {
           )
         })}
       </div>
+
+      {step === 0 && (
+        <div className="bg-[#0d1225] border border-gray-800 rounded-lg p-6 space-y-5">
+          <div>
+            <h2 className="text-sm font-mono text-white mb-2">Connect the coordinator's Google Drive</h2>
+            <p className="text-sm text-gray-500 font-mono">
+              An-Ra uses one coordinator identity to publish state, sparse deltas, and recovery checkpoints.
+              Worker accounts only need Editor access to the shared folder.
+            </p>
+          </div>
+
+          <div className="bg-gray-900 rounded p-3 text-xs font-mono text-gray-500">
+            Google will open in a new tab. Approve Drive access, then return here; this page checks the
+            connection automatically every two seconds.
+          </div>
+
+          {error && (
+            <div className="bg-warning/10 border border-warning/30 rounded px-3 py-2 text-warning text-xs font-mono">
+              {error}
+            </div>
+          )}
+
+          <button
+            onClick={handleConnectDrive}
+            disabled={loading || checkingAuth}
+            className="bg-accent text-deep text-sm font-mono px-5 py-2 rounded hover:bg-accent/90 transition-colors disabled:opacity-40"
+          >
+            {checkingAuth ? 'Checking connection...' : loading ? 'Opening Google...' : 'Connect Google Drive'}
+          </button>
+
+          {authUrl && (
+            <a href={authUrl} target="_blank" rel="noreferrer" className="block text-xs font-mono text-accent hover:underline">
+              OAuth tab did not open? Continue here ↗
+            </a>
+          )}
+        </div>
+      )}
 
       {step === 1 && (
         <div className="bg-[#0d1225] border border-gray-800 rounded-lg p-6 space-y-5">

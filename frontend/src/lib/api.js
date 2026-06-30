@@ -12,12 +12,12 @@ async function request(path, options = {}) {
     })
     if (!res.ok) {
       const text = await res.text().catch(() => '')
+      let detail = text || res.statusText
       try {
         const json = JSON.parse(text)
-        throw new Error(json.detail || `API ${res.status}: ${res.statusText}`)
-      } catch {
-        throw new Error(`API ${res.status}: ${text || res.statusText}`)
-      }
+        detail = json.detail || detail
+      } catch { /* response was not JSON */ }
+      throw new Error(`API ${res.status}: ${detail}`)
     }
     return res.json()
   } finally {
@@ -26,6 +26,10 @@ async function request(path, options = {}) {
 }
 
 export const api = {
+  getAuthLogin: () => request('/api/auth/login'),
+
+  getAuthStatus: () => request('/api/auth/status'),
+
   initCluster: (data) => request('/api/cluster/init', {
     method: 'POST', body: JSON.stringify(data), timeout: 30000,
   }),

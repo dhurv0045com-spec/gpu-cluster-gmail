@@ -1,4 +1,4 @@
-import { useRef, useEffect } from 'react'
+import { useEffect, useMemo, useRef } from 'react'
 
 const COLS = 64
 const CELL_W = 4
@@ -8,11 +8,16 @@ const GAP = 1
 export default function GradientHeatmap({ layerNorms = [] }) {
   const canvasRef = useRef(null)
   const animRef = useRef(null)
-  const normsRef = useRef(layerNorms)
+  const normalizedNorms = useMemo(() => {
+    const logged = layerNorms.map(value => Math.log1p(Math.max(0, Number(value) || 0)))
+    const maximum = Math.max(...logged, 0)
+    return maximum > 0 ? logged.map(value => value / maximum) : logged
+  }, [layerNorms])
+  const normsRef = useRef(normalizedNorms)
 
   useEffect(() => {
-    normsRef.current = layerNorms
-  }, [layerNorms])
+    normsRef.current = normalizedNorms
+  }, [normalizedNorms])
 
   const rows = Math.max(layerNorms.length, 1)
   const width = COLS * (CELL_W + GAP) - GAP
@@ -66,7 +71,7 @@ export default function GradientHeatmap({ layerNorms = [] }) {
     }
   }, [rows, width, height])
 
-  if (rows === 0) {
+  if (layerNorms.length === 0) {
     return (
       <div className="bg-[#0d1225] border border-gray-800 rounded-lg p-4">
         <h3 className="text-xs font-mono text-gray-600 uppercase tracking-wider mb-3">Gradient Heatmap</h3>
@@ -89,7 +94,7 @@ export default function GradientHeatmap({ layerNorms = [] }) {
       />
       <div className="flex justify-between text-[10px] font-mono text-gray-700 mt-2">
         <span>Layer 0</span>
-        <span>{layerNorms.length} layers</span>
+        <span>{layerNorms.length} layers · log-relative L2 norm</span>
       </div>
     </div>
   )

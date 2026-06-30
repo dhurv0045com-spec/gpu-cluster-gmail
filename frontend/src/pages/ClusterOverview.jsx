@@ -36,9 +36,7 @@ export default function ClusterOverview() {
   const phase = status?.phase || 'idle'
   const isPaused = phase === 'paused'
 
-  const layerNorms = active
-    .filter(w => w.loss != null && w.loss > 0)
-    .map(w => Math.max(0, Math.min(1, 1 - w.loss / 5)))
+  const layerNorms = status?.layer_norms || []
 
   async function handleAggregate() {
     setAggregating(true)

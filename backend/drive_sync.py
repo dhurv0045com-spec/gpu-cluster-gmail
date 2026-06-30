@@ -1,16 +1,15 @@
-import time
+import io
 import json
+import logging
 import os
 import tempfile
-import io
-import logging
-from pathlib import Path
-from google.oauth2.credentials import Credentials
+import time
+
 from google.auth.transport.requests import Request as AuthRequest
+from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
-from typing import Optional
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger("anra-coordinator.drive")
 
@@ -62,13 +61,13 @@ class DriveSync:
                 break
         return all_files
 
-    def _get_file_id(self, filename: str, parent_id: Optional[str] = None) -> Optional[str]:
+    def _get_file_id(self, filename: str, parent_id: str | None = None) -> str | None:
         parent = parent_id or self.folder_id
         query = f"name='{filename}' and '{parent}' in parents and trashed=false"
         items = self._list_files(query, "files(id, name)")
         return items[0]["id"] if items else None
 
-    def _ensure_folder(self, name: str, parent_id: Optional[str] = None) -> str:
+    def _ensure_folder(self, name: str, parent_id: str | None = None) -> str:
         parent = parent_id or self.folder_id
         existing = self._get_file_id(name, parent)
         if existing:
@@ -76,6 +75,9 @@ class DriveSync:
         metadata = {"name": name, "mimeType": "application/vnd.google-apps.folder", "parents": [parent]}
         folder = self.service.files().create(body=metadata, fields="id").execute()
         return folder["id"]
+
+    def file_exists(self, filename: str) -> bool:
+        return self._get_file_id(filename) is not None
 
     def acquire_lock(self, holder_id: str, timeout: int = LOCK_TIMEOUT) -> bool:
         current = self.read_coordinator_state()
@@ -115,15 +117,40 @@ class DriveSync:
         logger.info(f"Uploaded {filename} ({os.path.getsize(local_path) / 1024 / 1024:.1f} MB)")
         return file["id"]
 
+    def write_sparse_delta(self, local_path: str, version: int) -> str:
+        filename = f"delta_v{version:06d}.npz"
+        existing = self._get_file_id(filename)
+        media = MediaFileUpload(local_path, mimetype="application/octet-stream", resumable=True)
+        if existing:
+            self.service.files().update(fileId=existing, media_body=media, fields="id").execute()
+        else:
+            metadata = {"name": filename, "parents": [self.folder_id]}
+            self.service.files().create(body=metadata, media_body=media, fields="id").execute()
+        logger.info(f"Uploaded {filename} ({os.path.getsize(local_path) / 1024 / 1024:.1f} MB)")
+        return filename
+
+    def download_file(self, filename: str, local_path: str | None = None) -> str:
+        file_id = self._get_file_id(filename)
+        if not file_id:
+            raise FileNotFoundError(f"Drive file {filename} not found")
+        destination = local_path or os.path.join(tempfile.gettempdir(), filename)
+        request = self.service.files().get_media(fileId=file_id)
+        with io.FileIO(destination, "wb") as file_handle:
+            downloader = MediaIoBaseDownload(file_handle, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+        return destination
+
     def read_gradient_file(self, worker_id: str, step: int) -> str:
         worker_folder_id = self._get_file_id(worker_id)
         if not worker_folder_id:
             raise FileNotFoundError(f"Worker folder {worker_id} not found")
-        filename = f"grad_step_{step:06d}.pt"
+        filename = f"grad_step_{step:06d}.npz"
         file_id = self._get_file_id(filename, worker_folder_id)
         if not file_id:
             raise FileNotFoundError(f"Gradient file {filename} not found for {worker_id}")
-        local_path = os.path.join(tempfile.gettempdir(), f"{worker_id}_grad_step_{step:06d}.pt")
+        local_path = os.path.join(tempfile.gettempdir(), f"{worker_id}_grad_step_{step:06d}.npz")
         request = self.service.files().get_media(fileId=file_id)
         with io.FileIO(local_path, "wb") as fh:
             downloader = MediaIoBaseDownload(fh, request)
@@ -152,8 +179,11 @@ class DriveSync:
                 "global_step": 0, "phase": "idle", "expected_workers": [],
                 "submitted_this_step": [], "master_weights_version": 0,
                 "master_weights_path": "", "current_lr": 3e-4,
+                "checkpoint_version": 0, "delta_path": "", "delta_history": [],
+                "latest_layer_norms": [],
                 "lock_holder": None, "lock_time": None,
                 "total_target_steps": 0, "submission_times": {},
+                "gradient_submissions": {},
             }
         request = self.service.files().get_media(fileId=file_id)
         content = io.BytesIO()
@@ -169,8 +199,11 @@ class DriveSync:
                 "global_step": 0, "phase": "idle", "expected_workers": [],
                 "submitted_this_step": [], "master_weights_version": 0,
                 "master_weights_path": "", "current_lr": 3e-4,
+                "checkpoint_version": 0, "delta_path": "", "delta_history": [],
+                "latest_layer_norms": [],
                 "lock_holder": None, "lock_time": None,
                 "total_target_steps": 0, "submission_times": {},
+                "gradient_submissions": {},
             }
 
     def list_submitted_gradients(self, step: int, worker_ids: list[str]) -> list[str]:
@@ -181,11 +214,11 @@ class DriveSync:
                 found.append(file_id)
         return found
 
-    def list_worker_gradient_files(self, worker_id: str, step: int) -> Optional[str]:
+    def list_worker_gradient_files(self, worker_id: str, step: int) -> str | None:
         worker_folder_id = self._get_file_id(worker_id)
         if not worker_folder_id:
             return None
-        filename = f"grad_step_{step:06d}.pt"
+        filename = f"grad_step_{step:06d}.npz"
         return self._get_file_id(filename, worker_folder_id)
 
     def cleanup_old_gradients(self, keep_last_n_steps: int = 3):

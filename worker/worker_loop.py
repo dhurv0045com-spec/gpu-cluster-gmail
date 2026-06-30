@@ -1,20 +1,157 @@
+import json
 import os
 import sys
 import time
-import json
-import torch
-import torch.nn.functional as F
-import requests
 from pathlib import Path
+
+import requests
+import torch
+from torch.nn import functional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from drive_worker import (
-    load_model_from_checkpoint, save_gradients_to_drive,
-    get_latest_master_weights, get_gpu_memory_mb,
-    read_coordinator_state, should_stop,
+    get_gpu_memory_mb,
+    get_latest_master_weights,
+    load_model_from_checkpoint,
+    read_coordinator_state,
+    save_gradients_to_drive,
+    should_stop,
 )
-from wait_for_aggregation import wait_for_aggregation
+from sparse_grad import apply_sparse_delta_to_model, compute_layer_norms, load_sparse_gradient
+from wait_for_aggregation import wait_for_sync_update
+
+SYNC_EVERY_N_STEPS = 64
+SPARSITY_TOPK_FRACTION = 0.01
+
+
+def _build_adafactor(model, optimizer_factory=None, learning_rate: float = 1e-4):
+    """Use An-Ra's supplied factory when injected, otherwise PyTorch Adafactor."""
+    if optimizer_factory is not None:
+        return optimizer_factory(model.parameters(), lr=learning_rate)
+    adafactor = getattr(torch.optim, "Adafactor", None)
+    if adafactor is None:
+        raise RuntimeError(
+            "This worker requires torch.optim.Adafactor (PyTorch 2.5+) or an optimizer_factory "
+            "from An-Ra's training package."
+        )
+    return adafactor(model.parameters(), lr=learning_rate)
+
+
+def _cluster_file(cluster_drive_folder: str, filename: str) -> str:
+    return str(Path(cluster_drive_folder) / Path(filename).name)
+
+
+def _apply_sync_manifest(model, manifest: dict, current_version: int, cluster_drive_folder: str,
+                         model_class, device: str, model_kwargs: dict):
+    """Apply a complete consecutive delta chain, reloading a snapshot if needed."""
+    target_version = int(manifest.get("master_weights_version", current_version))
+    if target_version <= current_version:
+        return model, current_version, False
+
+    history = {
+        int(entry["version"]): entry
+        for entry in manifest.get("delta_history", [])
+        if "version" in entry and "path" in entry
+    }
+    needed = list(range(current_version + 1, target_version + 1))
+    reloaded = False
+
+    if not all(version in history for version in needed):
+        checkpoint_version = int(manifest.get("checkpoint_version", 0))
+        checkpoint_name = manifest.get("master_weights_path", "")
+        checkpoint_path = _cluster_file(cluster_drive_folder, checkpoint_name) if checkpoint_name else ""
+        if checkpoint_version <= current_version or not checkpoint_path or not os.path.exists(checkpoint_path):
+            missing = [version for version in needed if version not in history]
+            raise RuntimeError(f"Cannot recover missing delta versions {missing}; checkpoint is unavailable")
+        model = load_model_from_checkpoint(checkpoint_path, model_class, device, model_kwargs)
+        current_version = checkpoint_version
+        needed = list(range(current_version + 1, target_version + 1))
+        reloaded = True
+
+    for version in needed:
+        entry = history.get(version)
+        if entry is None:
+            raise RuntimeError(f"Sync manifest is missing delta v{version}")
+        delta_path = _cluster_file(cluster_drive_folder, entry["path"])
+        if not os.path.exists(delta_path):
+            raise FileNotFoundError(f"Sparse delta not yet visible in Drive mount: {delta_path}")
+        delta = load_sparse_gradient(delta_path)
+        if delta["model_version"] != version:
+            raise ValueError(f"Delta file version {delta['model_version']} does not match manifest v{version}")
+        # Keep averaged gradients in fp16 on disk, but perform LR scaling in
+        # fp32 here so small updates do not underflow during serialization.
+        values = delta["values"] * delta.get("learning_rate", 1.0)
+        apply_sparse_delta_to_model(model, delta["indices"], values)
+        current_version = version
+    return model, current_version, reloaded
+
+
+def _do_sparse_sync_round(model, coordinator_url: str, worker_id: str, cluster_drive_folder: str,
+                          step: int, model_version: int, accumulated_tokens: int,
+                          sparsity_fraction: float, model_class, device: str, model_kwargs: dict):
+    layer_norms = compute_layer_norms(dict(model.named_parameters()))
+    gradient_path = save_gradients_to_drive(
+        model,
+        step,
+        worker_id,
+        cluster_drive_folder,
+        model_version,
+        accumulated_tokens,
+        topk_fraction=sparsity_fraction,
+    )
+    try:
+        response = requests.post(
+            f"{coordinator_url}/api/workers/{worker_id}/gradient_ready",
+            json={
+                "step": step,
+                "grad_file_path": gradient_path,
+                "minibatch_tokens": accumulated_tokens,
+                "model_version": model_version,
+                "layer_norms": layer_norms,
+            },
+            timeout=30,
+        )
+        if response.status_code == 409:
+            manifest = read_coordinator_state(cluster_drive_folder)
+            if manifest.get("master_weights_version", 0) > model_version:
+                model, model_version, reloaded = _apply_sync_manifest(
+                    model,
+                    manifest,
+                    model_version,
+                    cluster_drive_folder,
+                    model_class,
+                    device,
+                    model_kwargs,
+                )
+                # The coordinator already advanced, so these accumulated
+                # gradients are stale. Catching up is a successful round; the
+                # caller will clear them before computing on the new version.
+                return model, model_version, reloaded, True
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        print(f"Sparse sync signal failed: {exc}")
+        return model, model_version, False, False
+
+    manifest = wait_for_sync_update(
+        model_version, step, cluster_drive_folder, worker_id, timeout_seconds=300
+    )
+    if not manifest:
+        return model, model_version, False, False
+    try:
+        model, model_version, reloaded = _apply_sync_manifest(
+            model,
+            manifest,
+            model_version,
+            cluster_drive_folder,
+            model_class,
+            device,
+            model_kwargs,
+        )
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        print(f"Sparse sync update is not ready: {exc}")
+        return model, model_version, False, False
+    return model, model_version, reloaded, True
 
 
 class PositionTrackingDataLoader:
@@ -32,7 +169,7 @@ class PositionTrackingDataLoader:
             if os.path.exists(self.position_file):
                 with open(self.position_file) as f:
                     return json.load(f).get("byte_offset", 0)
-        except (json.JSONDecodeError, IOError):
+        except (OSError, json.JSONDecodeError):
             pass
         return 0
 
@@ -40,7 +177,7 @@ class PositionTrackingDataLoader:
         try:
             with open(self.position_file, "w") as f:
                 json.dump({"byte_offset": offset, "updated_at": time.time()}, f)
-        except IOError:
+        except OSError:
             pass
 
     def __iter__(self):
@@ -54,7 +191,7 @@ class PositionTrackingDataLoader:
                 self.start_offset = start_offset
 
             def __iter__(self):
-                with open(self.path, "r", encoding="utf-8", errors="ignore") as f:
+                with open(self.path, encoding="utf-8", errors="ignore") as f:
                     f.seek(self.start_offset)
                     buffer = ""
                     for line in f:
@@ -90,7 +227,14 @@ def run_worker_loop(
     tokenizer_class=None,
     model_kwargs: dict = None,
     use_fp16_gradients: bool = True,
+    optimizer_factory=None,
+    learning_rate: float = 1e-4,
+    sync_every_n_steps: int = SYNC_EVERY_N_STEPS,
+    sparsity_fraction: float = SPARSITY_TOPK_FRACTION,
 ):
+    del use_fp16_gradients
+    if sync_every_n_steps < 1:
+        raise ValueError("sync_every_n_steps must be positive")
     sys.path.insert(0, anra_repo_path)
 
     resp = requests.post(f"{coordinator_url}/api/workers/register", json={
@@ -102,7 +246,9 @@ def run_worker_loop(
     assignment = resp.json()
     print(f"Registered as slot {assignment['assigned_slot']}")
 
-    master_weights = assignment.get("master_weights_path") or checkpoint_path
+    master_weights_name = assignment.get("master_weights_path")
+    mounted_master = _cluster_file(cluster_drive_folder, master_weights_name) if master_weights_name else ""
+    master_weights = mounted_master if mounted_master and os.path.exists(mounted_master) else checkpoint_path
     if not os.path.exists(master_weights):
         master_weights = get_latest_master_weights(cluster_drive_folder)
         if not master_weights:
@@ -111,6 +257,15 @@ def run_worker_loop(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Loading model on {device}...")
     model = load_model_from_checkpoint(master_weights, model_class, device, model_kwargs)
+
+    coordinator_state = read_coordinator_state(cluster_drive_folder)
+    model_version = int(coordinator_state.get("checkpoint_version", 0))
+    if coordinator_state.get("master_weights_version", 0) > model_version:
+        model, model_version, _ = _apply_sync_manifest(
+            model, coordinator_state, model_version, cluster_drive_folder, model_class, device, model_kwargs
+        )
+    optimizer = _build_adafactor(model, optimizer_factory, learning_rate)
+    optimizer.zero_grad(set_to_none=True)
 
     if tokenizer_class:
         tok_path = os.path.join(anra_repo_path, "tokenizer", "tokenizer_v3.json")
@@ -128,8 +283,9 @@ def run_worker_loop(
 
     step = 0
     last_loss = 0.0
-    model_version = 0
     consecutive_errors = 0
+    accumulated_steps_since_sync = 0
+    accumulated_tokens = 0
 
     while not should_stop():
         try:
@@ -148,15 +304,44 @@ def run_worker_loop(
                 print("Coordinator says stop. Training complete.")
                 break
             elif command == "reload_weights":
-                new_weights = get_latest_master_weights(cluster_drive_folder)
-                if new_weights:
-                    print(f"Reloading weights from {new_weights}")
-                    model = load_model_from_checkpoint(new_weights, model_class, device, model_kwargs)
-                    model_version += 1
+                manifest = read_coordinator_state(cluster_drive_folder)
+                model, model_version, reloaded = _apply_sync_manifest(
+                    model, manifest, model_version, cluster_drive_folder, model_class, device, model_kwargs
+                )
+                if reloaded:
+                    optimizer = _build_adafactor(model, optimizer_factory, learning_rate)
+                    optimizer.zero_grad(set_to_none=True)
                 continue
             elif command == "pause":
                 print("Paused by coordinator...")
                 time.sleep(5)
+                continue
+
+            if accumulated_steps_since_sync >= sync_every_n_steps:
+                model, model_version, reloaded, synced = _do_sparse_sync_round(
+                    model,
+                    coordinator_url,
+                    worker_id,
+                    cluster_drive_folder,
+                    step,
+                    model_version,
+                    accumulated_tokens,
+                    sparsity_fraction,
+                    model_class,
+                    device,
+                    model_kwargs,
+                )
+                if synced:
+                    if reloaded:
+                        optimizer = _build_adafactor(model, optimizer_factory, learning_rate)
+                    optimizer.zero_grad(set_to_none=True)
+                    accumulated_steps_since_sync = 0
+                    accumulated_tokens = 0
+                    consecutive_errors = 0
+                    print(f"Sparse sync complete | step {step} | model v{model_version}")
+                else:
+                    print(f"Sync failed at step {step}; retaining accumulated gradients for retry")
+                    time.sleep(5)
                 continue
 
             try:
@@ -170,36 +355,17 @@ def run_worker_loop(
             labels = batch["labels"].to(device)
 
             logits, _ = model(input_ids)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
-            loss.backward()
-
-            grad_path = save_gradients_to_drive(
-                model, step, worker_id, cluster_drive_folder,
-                model_version, input_ids.numel(), last_loss,
-                use_fp16=use_fp16_gradients,
-            )
-
-            try:
-                requests.post(f"{coordinator_url}/api/workers/{worker_id}/gradient_ready", json={
-                    "step": step,
-                    "grad_file_path": grad_path,
-                    "minibatch_tokens": input_ids.numel(),
-                }, timeout=30)
-            except requests.RequestException as e:
-                print(f"Warning: Failed to signal coordinator: {e}")
-
-            new_weights_path = wait_for_aggregation(
-                step, cluster_drive_folder, worker_id, timeout_seconds=300
-            )
-
-            if new_weights_path:
-                model = load_model_from_checkpoint(new_weights_path, model_class, device, model_kwargs)
-                model_version += 1
-
+            loss = functional.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
+            (loss / sync_every_n_steps).backward()
             last_loss = loss.item()
             step += 1
+            accumulated_steps_since_sync += 1
+            accumulated_tokens += input_ids.numel()
             consecutive_errors = 0
-            print(f"Step {step} | Loss: {last_loss:.4f} | GPU: {get_gpu_memory_mb():.0f}MB | v{model_version}")
+            print(
+                f"Step {step} | Loss: {last_loss:.4f} | GPU: {get_gpu_memory_mb():.0f}MB | "
+                f"v{model_version} | accumulation {accumulated_steps_since_sync}/{sync_every_n_steps}"
+            )
 
         except Exception as e:
             consecutive_errors += 1
